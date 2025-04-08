@@ -1,9 +1,3 @@
-# 先应用补丁
-try:
-    import fix_dependencies
-except ImportError:
-    pass
-
 from dify_plugin import Plugin, DifyPluginEnv
 
 plugin = Plugin(DifyPluginEnv(MAX_REQUEST_TIMEOUT=120))
