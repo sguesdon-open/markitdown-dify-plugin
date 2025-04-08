@@ -1,0 +1,57 @@
+name: Plugin Package & PR
+on:
+  push:
+    branches: [ main ]  # 或修改为你实际主分支名
+jobs:
+  build-and-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v3
+      - name: Download Plugin CLI
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/bin
+          wget https://github.com/langgenius/dify-plugin-daemon/releases/download/0.0.6/dify-plugin-linux-amd64 -O $GITHUB_WORKSPACE/bin/dify-plugin
+          chmod +x $GITHUB_WORKSPACE/bin/dify-plugin
+      - name: Get Plugin Version
+        id: get_version
+        run: |
+          VERSION=$(grep "^version:" manifest.yaml | cut -d' ' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+      - name: Package Plugin
+        run: |
+          cd $GITHUB_WORKSPACE
+          ./bin/dify-plugin plugin package . -o markitdown-${{ steps.get_version.outputs.version }}.difypkg
+      - name: Checkout target repository
+        uses: actions/checkout@v3
+        with:
+          repository: Yevanchen/dify-plugins
+          path: dify-plugins
+          token: ${{ secrets.PLUGIN_ACTION }}
+      - name: Commit and Push Changes
+        run: |
+          mkdir -p dify-plugins/yevanchen/markitdown
+          mv markitdown-${{ steps.get_version.outputs.version }}.difypkg dify-plugins/yevanchen/markitdown/
+
+          cd dify-plugins
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git fetch --unshallow
+          git checkout main
+          git pull origin main
+          BRANCH_NAME="update-markitdown-${{ steps.get_version.outputs.version }}"
+          git checkout -b "$BRANCH_NAME"
+          git add yevanchen/markitdown/
+          git commit -m "Update markitdown plugin to version ${{ steps.get_version.outputs.version }}"
+          git push -u origin "$BRANCH_NAME" --force
+          sleep 5
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.PLUGIN_ACTION }}
+        run: |
+          gh pr create \
+            --repo langgenius/dify-plugins \
+            --head "Yevanchen:update-markitdown-${{ steps.get_version.outputs.version }}" \
+            --base main \
+            --title "Update markitdown plugin to version ${{ steps.get_version.outputs.version }}" \
+            --body "Update markitdown plugin package to version ${{ steps.get_version.outputs.version }}\n\nChanges:\n- Updated plugin package file" || echo "PR already exists or skipped."
