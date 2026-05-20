@@ -24,6 +24,32 @@ parameters:
       zh_Hans: 上传文件进行处理
       pt_BR: Carregar arquivos para processamento
     form: llm
+  - name: enable_base64_images
+    type: boolean
+    required: false
+    label:
+      en_US: Enable Base64 Images
+      zh_Hans: 启用Base64图片
+      pt_BR: Habilitar Imagens Base64
+    human_description:
+      en_US: If enabled, images will be embedded as base64 data URIs in the markdown output
+      zh_Hans: 启用后，图片将以base64数据URI的形式嵌入到Markdown输出中
+      pt_BR: Se habilitado, as imagens serão incorporadas como URIs de dados base64 na saída markdown
+    default: false
+    form: form
+  - name: upload_images
+    type: boolean
+    required: false
+    label:
+      en_US: Upload Images to Dify
+      zh_Hans: 上传图片到Dify
+      pt_BR: Enviar Imagens para o Dify
+    human_description:
+      en_US: If enabled, base64 images in the markdown will be uploaded to Dify and replaced by permanent URLs (recommended for RAG / vector DB indexing)
+      zh_Hans: 启用后，Markdown中的base64图片将被上传到Dify并替换为永久URL（推荐用于RAG/向量数据库索引）
+      pt_BR: Se habilitado, imagens base64 no markdown serão enviadas ao Dify e substituídas por URLs permanentes (recomendado para RAG / indexação em vector DB)
+    default: false
+    form: form
 extra:
   python:
     source: tools/markitdown.py
