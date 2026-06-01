@@ -12,6 +12,7 @@ identity:
   icon: micro.png
 tools:
   - tools/markitdown.yaml
+  - tools/apply_docx_crops.yaml
 extra:
   python:
     source: provider/markitdown.py

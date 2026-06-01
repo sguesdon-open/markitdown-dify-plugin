@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 from dify_plugin import Tool
 from dify_plugin.entities.tool import ToolInvokeMessage
 from markitdown import MarkItDown
+from tools.apply_docx_crops import apply_docx_crops
 
 class MarkitdownTool(Tool):
 
@@ -152,12 +153,20 @@ class MarkitdownTool(Tool):
                     temp_file.write(file.blob)
                     temp_file_path = temp_file.name
                 
+                cropped_path = None
                 try:
+                    # Appliquer les crops DOCX avant conversion
+                    convert_path = temp_file_path
+                    if file_extension.lower() in (".docx", ".docm"):
+                        cropped_path = temp_file_path + "_cropped" + file_extension
+                        if apply_docx_crops(temp_file_path, cropped_path):
+                            convert_path = cropped_path
+
                     md = MarkItDown()
                     # Keep data URIs if base64 output is requested OR if we
                     # plan to upload them (we need the raw bytes to upload)
                     keep_uris = enable_base64_images or upload_images
-                    result = md.convert(temp_file_path, keep_data_uris=keep_uris)
+                    result = md.convert(convert_path, keep_data_uris=keep_uris)
 
                     markdown_content = result.text_content
 
@@ -199,8 +208,9 @@ class MarkitdownTool(Tool):
                         })
                         
                 finally:
-                    if os.path.exists(temp_file_path):
-                        os.unlink(temp_file_path)
+                    for path in [temp_file_path, cropped_path]:
+                        if path and os.path.exists(path):
+                            os.unlink(path)
                         
             except Exception as e:
                 error_msg = f"Error processing file {file.filename}: {str(e)}"
