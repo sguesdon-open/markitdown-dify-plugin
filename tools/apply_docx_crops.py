@@ -4,6 +4,7 @@ import tempfile
 import os
 import zipfile
 import xml.etree.ElementTree as ET
+import io
 
 from dify_plugin import Tool
 from dify_plugin.entities.tool import ToolInvokeMessage
@@ -19,8 +20,15 @@ _NS = {
 
 
 def _parse_crop_pct(val: str) -> float:
-    """Word stocke les valeurs srcRect en 1/100 000 (ex: 10000 = 10%)."""
-    return int(val) / 100_000.0
+    """Word stocke les valeurs srcRect en 1/100 000 (ex: 10000 = 10%).
+    Les valeurs négatives (zoom-out Word) sont clampées à 0."""
+    return max(0.0, int(val) / 100_000.0)
+
+
+def _has_real_crop(attrs: dict) -> bool:
+    """Retourne True si au moins une valeur srcRect est positive (crop réel).
+    Les srcRect avec uniquement des valeurs nulles ou négatives sont ignorés."""
+    return any(int(v) > 0 for v in attrs.values())
 
 
 def apply_docx_crops(src_path: str, dst_path: str) -> bool:
@@ -28,40 +36,68 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
     Lit src_path (.docx), applique physiquement les crops Word (a:srcRect)
     sur chaque image avec Pillow, supprime le srcRect du XML, et écrit dst_path.
     Retourne True si au moins une image a été croppée.
+
+    Corrections vs version précédente :
+    - Images partagées avec crops différents (sprite sheets) : crée une nouvelle
+      image par usage et met à jour les relations, au lieu d'écraser le fichier
+      source (ce qui cassait les usages suivants de la même image).
+    - Valeurs srcRect négatives (zoom-out Word) : clampées à 0, srcRect ignoré
+      si aucune valeur positive.
     """
     try:
         from PIL import Image
     except ImportError:
         return False
 
-    modified = False
+    from pathlib import Path
 
     with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
         # 1. Extraire le docx
         with zipfile.ZipFile(src_path, "r") as z:
             z.extractall(tmp)
 
         # 2. Lire les relations
-        rels_path = os.path.join(tmp, "word", "_rels", "document.xml.rels")
-        if not os.path.exists(rels_path):
+        rels_path = tmp / "word" / "_rels" / "document.xml.rels"
+        if not rels_path.exists():
             return False
 
-        rels_root = ET.parse(rels_path).getroot()
+        rels_tree = ET.parse(rels_path)
+        rels_root = rels_tree.getroot()
         rel_map = {r.get("Id"): r.get("Target") for r in rels_root}
 
+        # Calculer le prochain rId disponible (pour les nouvelles relations)
+        existing_ids = [
+            int(r.get("Id", "rId0").replace("rId", ""))
+            for r in rels_root if (r.get("Id") or "").startswith("rId")
+        ]
+        _next_rid = [max(existing_ids, default=0) + 1]
+
+        def _new_rid():
+            rid = f"rId{_next_rid[0]}"
+            _next_rid[0] += 1
+            return rid
+
         # 3. Parser document.xml
-        doc_path = os.path.join(tmp, "word", "document.xml")
+        doc_path = tmp / "word" / "document.xml"
         doc_tree = ET.parse(doc_path)
         doc_root = doc_tree.getroot()
 
         # 4. Parcourir les blipFill avec srcRect
+        crops_applied = 0
+
         for blipFill in doc_root.iter(f"{{{_NS['pic']}}}blipFill"):
             src_rect = blipFill.find(f"{{{_NS['a']}}}srcRect")
             if src_rect is None:
                 continue
 
-            attrs = {k: src_rect.get(k, "0") for k in ("l", "t", "r", "b")}
-            if all(v == "0" for v in attrs.values()):
+            # Ne récupérer que les attributs présents dans le XML
+            attrs = {k: src_rect.get(k, "0")
+                     for k in ("l", "t", "r", "b") if src_rect.get(k) is not None}
+
+            # Ignorer si pas de crop réel (vide ou que des valeurs négatives/nulles)
+            if not attrs or not _has_real_crop(attrs):
                 continue
 
             blip = blipFill.find(f"{{{_NS['a']}}}blip")
@@ -73,9 +109,8 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
                 continue
 
             img_rel = rel_map[embed]
-            # Les chemins de relations sont relatifs à word/
-            img_abs = os.path.normpath(os.path.join(tmp, "word", img_rel))
-            if not os.path.exists(img_abs):
+            img_abs = tmp / "word" / img_rel
+            if not img_abs.exists():
                 continue
 
             try:
@@ -83,35 +118,54 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
                 fmt = img.format or "PNG"
                 w, h = img.size
 
-                l = _parse_crop_pct(attrs["l"])
-                t = _parse_crop_pct(attrs["t"])
-                r = _parse_crop_pct(attrs["r"])
-                b = _parse_crop_pct(attrs["b"])
+                l = _parse_crop_pct(attrs.get("l", "0"))
+                t = _parse_crop_pct(attrs.get("t", "0"))
+                r = _parse_crop_pct(attrs.get("r", "0"))
+                b = _parse_crop_pct(attrs.get("b", "0"))
 
-                left   = int(w * l)
-                top    = int(h * t)
-                right  = int(w * (1.0 - r))
-                bottom = int(h * (1.0 - b))
+                # Clamp pour garantir des coordonnées valides
+                left   = max(0, int(w * l))
+                top    = max(0, int(h * t))
+                right  = min(w, int(w * (1.0 - r)))
+                bottom = min(h, int(h * (1.0 - b)))
 
                 if left >= right or top >= bottom:
                     continue
 
                 cropped = img.crop((left, top, right, bottom))
                 save_fmt = fmt if fmt in ("PNG", "JPEG", "GIF", "BMP", "TIFF") else "PNG"
-                cropped.save(img_abs, format=save_fmt)
 
-                # Supprimer srcRect pour éviter un double-crop
+                # Créer une NOUVELLE image pour ce crop (ne pas écraser l'originale,
+                # qui peut être réutilisée avec un srcRect différent ailleurs)
+                new_name = f"image_crop_{crops_applied + 1}{img_abs.suffix}"
+                new_img_path = tmp / "word" / "media" / new_name
+
+                out = io.BytesIO()
+                cropped.save(out, format=save_fmt)
+                new_img_path.write_bytes(out.getvalue())
+
+                # Nouvelle relation pointant vers la nouvelle image
+                rid = _new_rid()
+                rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                new_rel = ET.SubElement(rels_root, "Relationship")
+                new_rel.set("Id", rid)
+                new_rel.set("Type", rel_ns)
+                new_rel.set("Target", f"media/{new_name}")
+
+                # Mettre à jour le blip et supprimer srcRect
+                blip.set(f"{{{_NS['r']}}}embed", rid)
                 blipFill.remove(src_rect)
-                modified = True
+                crops_applied += 1
 
             except Exception:
                 continue  # on garde l'image originale si erreur
 
-        if not modified:
+        if not crops_applied:
             return False
 
-        # 5. Réécrire document.xml
+        # 5. Réécrire document.xml ET les relations
         doc_tree.write(doc_path, xml_declaration=True, encoding="UTF-8")
+        rels_tree.write(rels_path, xml_declaration=True, encoding="UTF-8")
 
         # 6. Rezipper
         with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
