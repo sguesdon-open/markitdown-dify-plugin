@@ -4,9 +4,11 @@ import tempfile
 import os
 import zipfile
 import xml.etree.ElementTree as ET
+import io
 
 from dify_plugin import Tool
 from dify_plugin.entities.tool import ToolInvokeMessage
+from markitdown import MarkItDown
 
 # ---------------------------------------------------------------------------
 # Namespaces DrawingML / WordprocessingML
@@ -18,51 +20,101 @@ _NS = {
 }
 
 
-def _parse_crop_pct(val: str) -> float:
-    """Word stocke les valeurs srcRect en 1/100 000 (ex: 10000 = 10%)."""
-    return int(val) / 100_000.0
+def _parse_pct(val: str) -> float:
+    """Convertit une valeur srcRect Word (perMille×1000) en float 0..1.
+    Les valeurs négatives (zoom-out Word) sont clampées à 0."""
+    return max(0.0, int(val) / 100_000.0)
 
 
-def apply_docx_crops(src_path: str, dst_path: str) -> bool:
+def _has_real_crop(attrs: dict) -> bool:
+    """Retourne True si au moins une valeur est positive (crop réel)."""
+    return any(int(v) > 0 for v in attrs.values())
+
+
+def _crop_image_bytes(img_bytes: bytes, attrs: dict) -> bytes | None:
+    """Applique le crop et retourne les bytes, ou None si crop nul/invalide."""
+    from PIL import Image
+    img = Image.open(io.BytesIO(img_bytes))
+    fmt = img.format or "PNG"
+    w, h = img.size
+
+    l = _parse_pct(attrs.get("l", "0"))
+    t = _parse_pct(attrs.get("t", "0"))
+    r = _parse_pct(attrs.get("r", "0"))
+    b = _parse_pct(attrs.get("b", "0"))
+
+    left, top     = max(0, int(w * l)), max(0, int(h * t))
+    right, bottom = min(w, int(w * (1.0 - r))), min(h, int(h * (1.0 - b)))
+
+    if left >= right or top >= bottom or (left, top, right, bottom) == (0, 0, w, h):
+        return None
+
+    out = io.BytesIO()
+    save_fmt = fmt if fmt in ("PNG", "JPEG", "GIF", "BMP", "TIFF") else "PNG"
+    img.crop((left, top, right, bottom)).save(out, format=save_fmt)
+    return out.getvalue()
+
+
+def _apply_docx_crops(src_path: str, dst_path: str) -> bool:
     """
-    Lit src_path (.docx), applique physiquement les crops Word (a:srcRect)
-    sur chaque image avec Pillow, supprime le srcRect du XML, et écrit dst_path.
-    Retourne True si au moins une image a été croppée.
+    Lit src_path (.docx), applique physiquement les crops Word (a:srcRect).
+
+    Corrections vs version naïve :
+    - Images partagées avec crops différents (sprite sheets) : crée une nouvelle
+      image par usage et met à jour les relations, au lieu d'écraser le fichier.
+    - Valeurs srcRect négatives (zoom-out Word) : ignorées (clampées à 0).
+    - srcRect vide : ignoré.
+
+    Retourne True si au moins un crop a été appliqué.
     """
     try:
-        from PIL import Image
+        from PIL import Image  # noqa: F401 — vérification import
     except ImportError:
         return False
 
-    modified = False
+    import tempfile as _tempfile
+    from pathlib import Path
 
-    with tempfile.TemporaryDirectory() as tmp:
-        # 1. Extraire le docx
+    with _tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
         with zipfile.ZipFile(src_path, "r") as z:
             z.extractall(tmp)
 
-        # 2. Lire les relations
-        rels_path = os.path.join(tmp, "word", "_rels", "document.xml.rels")
-        if not os.path.exists(rels_path):
+        rels_path = tmp / "word" / "_rels" / "document.xml.rels"
+        if not rels_path.exists():
             return False
 
-        rels_root = ET.parse(rels_path).getroot()
+        rels_tree = ET.parse(rels_path)
+        rels_root = rels_tree.getroot()
         rel_map = {r.get("Id"): r.get("Target") for r in rels_root}
 
-        # 3. Parser document.xml
-        doc_path = os.path.join(tmp, "word", "document.xml")
+        # Prochain rId disponible
+        existing_ids = [int(r.get("Id", "rId0").replace("rId", ""))
+                        for r in rels_root if (r.get("Id") or "").startswith("rId")]
+        _next_rid = [max(existing_ids, default=0) + 1]
+
+        def _new_rid():
+            rid = f"rId{_next_rid[0]}"
+            _next_rid[0] += 1
+            return rid
+
+        doc_path = tmp / "word" / "document.xml"
         doc_tree = ET.parse(doc_path)
         doc_root = doc_tree.getroot()
 
-        # 4. Parcourir les blipFill avec srcRect
+        crops_applied = 0
+
         for blipFill in doc_root.iter(f"{{{_NS['pic']}}}blipFill"):
             src_rect = blipFill.find(f"{{{_NS['a']}}}srcRect")
             if src_rect is None:
                 continue
 
-            attrs = {k: src_rect.get(k, "0") for k in ("l", "t", "r", "b")}
-            if all(v == "0" for v in attrs.values()):
-                continue
+            attrs = {k: src_rect.get(k, "0")
+                     for k in ("l", "t", "r", "b") if src_rect.get(k) is not None}
+
+            if not attrs or not _has_real_crop(attrs):
+                continue  # pas de crop réel
 
             blip = blipFill.find(f"{{{_NS['a']}}}blip")
             if blip is None:
@@ -72,113 +124,143 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
             if embed not in rel_map:
                 continue
 
-            img_rel = rel_map[embed]
-            # Les chemins de relations sont relatifs à word/
-            img_abs = os.path.normpath(os.path.join(tmp, "word", img_rel))
-            if not os.path.exists(img_abs):
+            img_path = tmp / "word" / rel_map[embed]
+            if not img_path.exists():
                 continue
 
             try:
-                img = Image.open(img_abs)
-                fmt = img.format or "PNG"
-                w, h = img.size
-
-                l = _parse_crop_pct(attrs["l"])
-                t = _parse_crop_pct(attrs["t"])
-                r = _parse_crop_pct(attrs["r"])
-                b = _parse_crop_pct(attrs["b"])
-
-                left   = int(w * l)
-                top    = int(h * t)
-                right  = int(w * (1.0 - r))
-                bottom = int(h * (1.0 - b))
-
-                if left >= right or top >= bottom:
-                    continue
-
-                cropped = img.crop((left, top, right, bottom))
-                save_fmt = fmt if fmt in ("PNG", "JPEG", "GIF", "BMP", "TIFF") else "PNG"
-                cropped.save(img_abs, format=save_fmt)
-
-                # Supprimer srcRect pour éviter un double-crop
-                blipFill.remove(src_rect)
-                modified = True
-
+                cropped_bytes = _crop_image_bytes(img_path.read_bytes(), attrs)
             except Exception:
-                continue  # on garde l'image originale si erreur
+                continue
 
-        if not modified:
+            if cropped_bytes is None:
+                continue
+
+            # Créer une nouvelle image pour ce crop (safe même si image non partagée)
+            new_name = f"image_crop_{crops_applied + 1}{img_path.suffix}"
+            new_path = tmp / "word" / "media" / new_name
+            new_path.write_bytes(cropped_bytes)
+
+            # Nouvelle relation
+            rid = _new_rid()
+            rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+            new_rel = ET.SubElement(rels_root, "Relationship")
+            new_rel.set("Id", rid)
+            new_rel.set("Type", rel_ns)
+            new_rel.set("Target", f"media/{new_name}")
+
+            # Mettre à jour le blip et supprimer srcRect
+            blip.set(f"{{{_NS['r']}}}embed", rid)
+            blipFill.remove(src_rect)
+            crops_applied += 1
+
+        if not crops_applied:
             return False
 
-        # 5. Réécrire document.xml
         doc_tree.write(doc_path, xml_declaration=True, encoding="UTF-8")
+        rels_tree.write(rels_path, xml_declaration=True, encoding="UTF-8")
 
-        # 6. Rezipper
         with zipfile.ZipFile(dst_path, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-            for dp, _, fns in os.walk(tmp):
-                for fn in fns:
-                    f = os.path.join(dp, fn)
-                    zout.write(f, os.path.relpath(f, tmp))
+            for f in tmp.rglob("*"):
+                if f.is_file():
+                    zout.write(f, f.relative_to(tmp))
 
     return True
 
 
-class ApplyDocxCropsTool(Tool):
+# ---------------------------------------------------------------------------
+# Dify Tool
+# ---------------------------------------------------------------------------
+
+class MarkitdownTool(Tool):
     def _invoke(self, tool_parameters: dict[str, Any]) -> Generator[ToolInvokeMessage, None, None]:
-        files = tool_parameters.get("files", [])
+        files = tool_parameters.get('files', [])
+
         if not files:
             yield self.create_text_message("No files provided")
-            yield self.create_json_message({"status": "error", "message": "No files provided", "results": []})
+            yield self.create_json_message({
+                "status": "error",
+                "message": "No files provided",
+                "results": []
+            })
             return
 
+        results = []
         json_results = []
 
         for file in files:
-            file_extension = (file.extension or ".tmp").lower()
-
-            if file_extension not in (".docx", ".docm"):
-                yield self.create_text_message(f"Skipped {file.filename}: not a .docx/.docm file")
-                json_results.append({"filename": file.filename, "status": "skipped", "reason": "not a docx/docm"})
-                continue
-
-            src_path = None
-            dst_path = None
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as src_f:
-                    src_f.write(file.blob)
-                    src_path = src_f.name
+                file_extension = file.extension if file.extension else '.tmp'
 
-                dst_path = src_path + "_cropped" + file_extension
-                crop_applied = apply_docx_crops(src_path, dst_path)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as temp_file:
+                    temp_file.write(file.blob)
+                    temp_file_path = temp_file.name
 
-                if crop_applied:
-                    with open(dst_path, "rb") as out_f:
-                        cropped_bytes = out_f.read()
+                cropped_path = None
+                try:
+                    convert_path = temp_file_path
+
+                    # Appliquer les crops avant conversion pour les .docx
+                    if file_extension.lower() in ('.docx', '.docm'):
+                        cropped_path = temp_file_path + "_cropped.docx"
+                        if _apply_docx_crops(temp_file_path, cropped_path):
+                            convert_path = cropped_path
+
+                    md = MarkItDown()
+                    result = md.convert(convert_path)
+
                     yield self.create_blob_message(
-                        cropped_bytes,
-                        meta={"mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+                        result.text_content.encode(),
+                        meta={"mime_type": "text/markdown"},
                     )
-                    json_results.append({"filename": file.filename, "status": "success", "crops_applied": True})
-                else:
-                    # Aucun crop détecté : retourner le fichier original tel quel
-                    yield self.create_blob_message(
-                        file.blob,
-                        meta={"mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
-                    )
-                    json_results.append({"filename": file.filename, "status": "success", "crops_applied": False})
+
+                    if result and hasattr(result, 'text_content'):
+                        results.append({"filename": file.filename, "content": result.text_content})
+                        json_results.append({
+                            "filename": file.filename,
+                            "original_format": file_extension.lstrip('.'),
+                            "markdown_content": result.text_content,
+                            "status": "success"
+                        })
+                    else:
+                        error_msg = f"Conversion failed for file {file.filename}. Result: {result}"
+                        yield self.create_text_message(text=error_msg)
+                        json_results.append({
+                            "filename": file.filename,
+                            "original_format": file_extension.lstrip('.'),
+                            "error": error_msg,
+                            "status": "error"
+                        })
+
+                finally:
+                    for path in [temp_file_path, cropped_path]:
+                        if path and os.path.exists(path):
+                            os.unlink(path)
 
             except Exception as e:
-                error_msg = f"Error processing {file.filename}: {str(e)}"
-                yield self.create_text_message(error_msg)
-                json_results.append({"filename": file.filename, "status": "error", "error": error_msg})
-
-            finally:
-                for path in [src_path, dst_path]:
-                    if path and os.path.exists(path):
-                        os.unlink(path)
+                error_msg = f"Error processing file {file.filename}: {str(e)}"
+                yield self.create_text_message(text=error_msg)
+                json_results.append({
+                    "filename": file.filename,
+                    "original_format": file_extension.lstrip('.'),
+                    "error": error_msg,
+                    "status": "error"
+                })
 
         yield self.create_json_message({
-            "status": "success",
+            "status": "success" if results else "error",
             "total_files": len(files),
-            "results": json_results,
+            "successful_conversions": len(results),
+            "results": json_results
         })
+
+        if not results:
+            yield self.create_text_message("No files were successfully processed")
+        elif len(results) == 1:
+            yield self.create_text_message(results[0]["content"])
+        else:
+            combined = ""
+            for idx, r in enumerate(results, 1):
+                combined += f"\n{'='*50}\nFile {idx}: {r['filename']}\n{'='*50}\n\n"
+                combined += r["content"] + "\n\n"
+            yield self.create_text_message(combined.strip())
