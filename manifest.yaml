@@ -1,4 +1,4 @@
-version: 0.0.1-rc0
+version: 0.0.1
 type: plugin
 author: sguesdon-open
 name: markitdown
@@ -28,7 +28,7 @@ plugins:
   tools:
     - provider/markitdown.yaml
 meta:
-  version: 0.0.1-rc0
+  version: 0.0.1
   arch:
     - amd64
     - arm64
