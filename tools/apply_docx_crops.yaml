@@ -1,0 +1,29 @@
+identity:
+  name: apply_docx_crops
+  author: sguesdon-open
+  label:
+    en_US: Apply DOCX Image Crops
+    zh_Hans: 应用DOCX图片裁剪
+    pt_BR: Aplicar Cortes de Imagens DOCX
+description:
+  human:
+    en_US: Physically applies Word image crops (srcRect) to .docx/.docm files using Pillow, removing the crop metadata from XML.
+    zh_Hans: 使用Pillow对.docx/.docm文件中的Word图片裁剪(srcRect)进行物理应用，并从XML中删除裁剪元数据。
+    pt_BR: Aplica fisicamente os cortes de imagem Word (srcRect) em arquivos .docx/.docm usando Pillow, removendo os metadados de corte do XML.
+  llm: Physically applies Word image crops (srcRect) to .docx/.docm files using Pillow.
+parameters:
+  - name: files
+    type: files
+    required: true
+    label:
+      en_US: Files
+      zh_Hans: 文件
+      pt_BR: Arquivos
+    human_description:
+      en_US: Upload .docx or .docm files to apply image crops
+      zh_Hans: 上传.docx或.docm文件以应用图片裁剪
+      pt_BR: Envie arquivos .docx ou .docm para aplicar cortes de imagem
+    form: llm
+extra:
+  python:
+    source: tools/apply_docx_crops.py

@@ -1,6 +1,6 @@
-version: 0.0.4
+version: 0.0.1-rc0
 type: plugin
-author: yevanchen
+author: sguesdon-open
 name: markitdown
 label:
   en_US: markitdown
@@ -28,7 +28,7 @@ plugins:
   tools:
     - provider/markitdown.yaml
 meta:
-  version: 0.0.1
+  version: 0.0.1-rc0
   arch:
     - amd64
     - arm64
