@@ -18,6 +18,11 @@ _NS = {
     "r":   "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
 }
 
+# Namespace du fichier .rels — doit être enregistré SANS préfixe pour que
+# ET.write génère <Relationship> et non <ns0:Relationship>
+_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+ET.register_namespace("", _RELS_NS)
+
 
 def _parse_crop_pct(val: str) -> float:
     """Word stocke les valeurs srcRect en 1/100 000 (ex: 10000 = 10%).
@@ -37,12 +42,14 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
     sur chaque image avec Pillow, supprime le srcRect du XML, et écrit dst_path.
     Retourne True si au moins une image a été croppée.
 
-    Corrections vs version précédente :
+    Corrections :
     - Images partagées avec crops différents (sprite sheets) : crée une nouvelle
       image par usage et met à jour les relations, au lieu d'écraser le fichier
       source (ce qui cassait les usages suivants de la même image).
     - Valeurs srcRect négatives (zoom-out Word) : clampées à 0, srcRect ignoré
       si aucune valeur positive.
+    - Namespace du fichier .rels : enregistré sans préfixe pour éviter que
+      ET.write génère <ns0:Relationship> illisible par markitdown.
     """
     try:
         from PIL import Image
@@ -67,15 +74,19 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
         rels_root = rels_tree.getroot()
         rel_map = {r.get("Id"): r.get("Target") for r in rels_root}
 
-        # Calculer le prochain rId disponible (pour les nouvelles relations)
-        existing_ids = [
+        # Calculer le prochain rId disponible
+        existing_ids = set(
             int(r.get("Id", "rId0").replace("rId", ""))
             for r in rels_root if (r.get("Id") or "").startswith("rId")
-        ]
+        )
         _next_rid = [max(existing_ids, default=0) + 1]
 
         def _new_rid():
+            # Chercher le premier entier non utilisé
+            while _next_rid[0] in existing_ids:
+                _next_rid[0] += 1
             rid = f"rId{_next_rid[0]}"
+            existing_ids.add(_next_rid[0])
             _next_rid[0] += 1
             return rid
 
@@ -146,10 +157,10 @@ def apply_docx_crops(src_path: str, dst_path: str) -> bool:
 
                 # Nouvelle relation pointant vers la nouvelle image
                 rid = _new_rid()
-                rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
-                new_rel = ET.SubElement(rels_root, "Relationship")
+                rel_img_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+                new_rel = ET.SubElement(rels_root, f"{{{_RELS_NS}}}Relationship")
                 new_rel.set("Id", rid)
-                new_rel.set("Type", rel_ns)
+                new_rel.set("Type", rel_img_ns)
                 new_rel.set("Target", f"media/{new_name}")
 
                 # Mettre à jour le blip et supprimer srcRect
